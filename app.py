@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import re
 import logging
+import os
 
 app = Flask(__name__)
 
@@ -48,7 +49,6 @@ HTML = """
 </html>
 """
 
-# Полный serialized как у сайта (Всі оголошення)
 def build_serialized(date_site):
     return f"""from={date_site}&to={date_site}&streetid=&skyscraperid=&street=&house=&radio1580works=1&radio1580datetype=2&
 organizationMultiSelect[]=184&organizationMultiSelect[]=148&organizationMultiSelect[]=155&organizationMultiSelect[]=171&organizationMultiSelect[]=167&
@@ -76,7 +76,21 @@ def check_power(date_str, street_input, house_input):
     logging.info(f"Улица: {street_input}")
     logging.info(f"Дом: {house_input}")
 
-    scraper = cloudscraper.create_scraper()
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        }
+    )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Origin": "https://1562.kharkivrada.gov.ua",
+        "Referer": "https://1562.kharkivrada.gov.ua/perelik-vsi/",
+        "X-Requested-With": "XMLHttpRequest"
+    }
 
     date_site = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y/%m/%d")
     date_search = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%y")
@@ -96,11 +110,16 @@ def check_power(date_str, street_input, house_input):
 
     response = scraper.post(
         "https://1562.kharkivrada.gov.ua/ajax/inform/informList-v2.php",
-        data=payload
+        data=payload,
+        headers=headers,
+        timeout=30
     )
 
     logging.info(f"HTTP статус: {response.status_code}")
     logging.info(f"Размер HTML: {len(response.text)}")
+
+    if "Оголошеня відсутні" in response.text:
+        return "Оголошень на выбранную дату нет"
 
     soup = BeautifulSoup(response.text, "html.parser")
     cards = soup.find_all("div", class_="panelinform")
@@ -108,41 +127,30 @@ def check_power(date_str, street_input, house_input):
     logging.info(f"Найдено карточек: {len(cards)}")
 
     if not cards:
-        return "Карточки не найдены"
+        logging.warning("Карточки не найдены. Возможно Cloudflare блок.")
+        logging.info(response.text[:1000])
+        return "Карточки не найдены (возможна блокировка сервера)"
 
     results = []
 
-    for i, card in enumerate(cards, 1):
-
+    for card in cards:
         text = card.get_text(" ", strip=True)
 
-        logging.info(f"--- Карточка {i} ---")
-        logging.info(text)
-
-        # Проверка даты
         if date_search not in text:
             continue
 
-        # Проверка улицы (без учета регистра)
         if street_input.lower() not in text.lower():
             continue
 
-        # Точное совпадение дома
         pattern = rf"буд\.\s*{re.escape(house_input)}(?![-А-Яа-яA-Za-z])"
         if not re.search(pattern, text):
             continue
 
-        logging.info("✔ Найдено совпадение!")
-
-        # --- ИЗВЛЕЧЕНИЕ ДАННЫХ ---
-
-        # Заголовок
         title = ""
         h5 = card.find("h5")
         if h5:
             title = h5.get_text(" ", strip=True).replace("~", "—")
 
-        # Причина
         reason = ""
         reason_tag = card.find("pre")
         if reason_tag:
@@ -153,27 +161,22 @@ def check_power(date_str, street_input, house_input):
         modified = re.search(r"Дата модифікації\s*(\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2})", text)
         executor = re.search(r'Виконавець\s*(.+?)(?=Початок|$)', text)
 
-        result_block = "<b>Найдено отключение:</b><br><br>"
+        block = "<b>Найдено отключение:</b><br><br>"
 
         if title:
-            result_block += f"<b>Тип:</b> {title}<br><br>"
-
+            block += f"<b>Тип:</b> {title}<br><br>"
         if reason:
-            result_block += f"<b>Причина:</b> {reason}<br><br>"
-
+            block += f"<b>Причина:</b> {reason}<br><br>"
         if start:
-            result_block += f"<b>Початок:</b> {start.group(1)}<br>"
-
+            block += f"<b>Початок:</b> {start.group(1)}<br>"
         if end:
-            result_block += f"<b>{end.group(1)}:</b> {end.group(2)}<br>"
-
+            block += f"<b>{end.group(1)}:</b> {end.group(2)}<br>"
         if modified:
-            result_block += f"<b>Дата модифікації:</b> {modified.group(1)}<br>"
-
+            block += f"<b>Дата модифікації:</b> {modified.group(1)}<br>"
         if executor:
-            result_block += f"<b>Виконавець:</b> {executor.group(1).strip()}<br>"
+            block += f"<b>Виконавець:</b> {executor.group(1).strip()}<br>"
 
-        results.append(result_block)
+        results.append(block)
 
     if not results:
         return "Отключений по указанному адресу не найдено"
@@ -204,4 +207,5 @@ def index():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
